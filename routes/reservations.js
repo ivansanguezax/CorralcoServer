@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const reservationService = require('../services/reservationService');
+const reservationService = require('../services/reservationService.js');
 
 router.get('/', async (req, res, next) => {
   try {
