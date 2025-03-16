@@ -1,10 +1,10 @@
 {
   "name": "corralco",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "keywords": [],
   "author": "",
@@ -14,7 +14,9 @@
     "@notionhq/client": "^2.2.16",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3",
+    "redis": "^4.7.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

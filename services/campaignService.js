@@ -1,551 +1,1084 @@
-const { notion, campaignsDatabaseId } = require('../config/notion');
+const { notion, campaignsDatabaseId } = require("../config/notion");
+const horariosService = require("./horariosService");
+const { cacheService } = require("../config/cache");
+const notionQueue = require('../utils/requestQueue');
+const serviceResolver = require('./serviceResolver');
 
-/**
- * Servicio para interactuar con las cabañas en Notion
- */
-class CampaignService {
-  /**
-   * Obtiene todas las cabañas de la base de datos de Notion
-   */
+// Constantes para la caché y configuración
+const CACHE_TTL = {
+  DEFAULT: 300, // 5 minutos para la mayoría de operaciones
+  LONG: 3600, // 1 hora para datos estáticos
+  SHORT: 60, // 1 minuto para datos muy dinámicos
+  VERY_SHORT: 30, // 30 segundos para disponibilidad
+};
+
+const CACHE_KEYS = {
+  CAMPAIGN_STATUS: (id) => `campaign:${id}:status`,
+  CAMPAIGN_BEDS: (id) => `campaign:${id}:availableBeds`,
+  CAMPAIGN_DETAIL: (id) => `campaign:${id}:detail`,
+  ALL_CAMPAIGNS: "campaigns:all",
+  AVAILABLE_CAMPAIGNS: "campaigns:available",
+  RESERVED_CAMPAIGNS: "campaigns:reserved",
+  CABINS_ONLY: "campaigns:cabins",
+  HOSTELS_ONLY: "campaigns:hostels",
+};
+
+// Función de reintento con backoff exponencial
+const retry = async (operation, maxRetries = 5, delay = 500) => {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+
+      // Si el error es "rate_limited", espera más tiempo antes de reintentar
+      if (error.code === 'rate_limited') {
+        const waitTime = delay * Math.pow(2, attempt - 1); // Backoff exponencial
+        console.warn(`Intento ${attempt} fallido por rate limit. Esperando ${waitTime}ms`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else {
+        console.warn(`Intento ${attempt} fallido:`, error.message);
+        if (attempt === maxRetries) throw lastError;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  throw lastError;
+};
+
+// Convertir promesas en versión con reintentos
+const withRetry = (fn) => (...args) => retry(() => fn(...args));
+
+
+class campaignService {
+
   async getAllCampaigns() {
     try {
-      const response = await notion.databases.query({
-        database_id: campaignsDatabaseId,
-        sorts: [
-          {
-            property: 'Name',
-            direction: 'ascending',
-          },
-        ],
-      });
-
-      return this.formatCampaigns(response.results);
-    } catch (error) {
-      console.error('Error al obtener las cabañas:', error);
-      throw new Error('Error al obtener las cabañas desde Notion');
-    }
-  }
-
-  /**
-   * Obtiene una cabaña por su ID
-   */
-  async getCampaignById(cabinId) {
-    try {
-      const response = await notion.pages.retrieve({
-        page_id: cabinId
-      });
-      
-      return this.formatCampaign(response);
-    } catch (error) {
-      console.error(`Error al obtener la cabaña con ID ${cabinId}:`, error);
-      throw new Error(`Error al buscar cabaña con ID: ${cabinId}`);
-    }
-  }
-
-  /**
-   * Obtiene las cabañas disponibles (que no están reservadas)
-   */
-  async getAvailableCampaigns() {
-    try {
-      const response = await notion.databases.query({
-        database_id: campaignsDatabaseId,
-        filter: {
-          property: 'reservation_status',
-          select: {
-            equals: 'Disponible'
-          }
-        },
-        sorts: [
-          {
-            property: 'Name',
-            direction: 'ascending',
-          },
-        ],
-      });
-
-      return this.formatCampaigns(response.results);
-    } catch (error) {
-      console.error('Error al obtener las cabañas disponibles:', error);
-      throw new Error('Error al obtener las cabañas disponibles desde Notion');
-    }
-  }
-
-  /**
-   * Obtiene cabañas que están reservadas u ocupadas
-   */
-  async getReservedCabins() {
-    try {
-      const response = await notion.databases.query({
-        database_id: campaignsDatabaseId,
-        filter: {
-          or: [
-            {
-              property: 'reservation_status',
-              select: {
-                equals: 'Reservada'
-              }
-            },
-            {
-              property: 'reservation_status',
-              select: {
-                equals: 'Ocupada'
-              }
-            }
-          ]
-        },
-        sorts: [
-          {
-            property: 'Name',
-            direction: 'ascending',
-          },
-        ],
-      });
-
-      return this.formatCampaigns(response.results);
-    } catch (error) {
-      console.error('Error al obtener las cabañas reservadas:', error);
-      throw new Error('Error al obtener las cabañas reservadas desde Notion');
-    }
-  }
-
-  /**
-   * Obtiene una cabaña específica por su slug
-   */
-  async getCampaignBySlug(slug) {
-    try {
-      const response = await notion.databases.query({
-        database_id: campaignsDatabaseId,
-        filter: {
-          property: 'slug',
-          rich_text: {
-            equals: slug
-          }
-        }
-      });
-
-      if (response.results.length === 0) {
-        throw new Error(`No se encontró la cabaña con el slug ${slug}`);
+      // Intentar obtener desde caché
+      const cachedCampaigns = await cacheService.get(CACHE_KEYS.ALL_CAMPAIGNS);
+      if (cachedCampaigns) {
+        return cachedCampaigns;
       }
 
-      const pageData = this.formatCampaign(response.results[0]);
-      
-      // Obtener el contenido de la página
-      const pageContent = await this.getPageContent(pageData.id);
-      
-      // Agregar el contenido a los datos de la página
-      return {
-        ...pageData,
-        content: pageContent
-      };
+      // Función para consultar a Notion con reintentos
+      const fetchFromNotion = withRetry(async () => {
+        const response = await notion.databases.query({
+          database_id: campaignsDatabaseId,
+          sorts: [
+            {
+              property: "Name",
+              direction: "ascending",
+            },
+          ],
+        });
+        return response;
+      });
+
+      const response = await fetchFromNotion();
+      const campaigns = this.formatCampaigns(response.results);
+
+      // Procesar y enriquecer los datos
+      await this.enrichCampaignsWithStatus(campaigns);
+
+      // Guardar en caché
+      await cacheService.set(
+        CACHE_KEYS.ALL_CAMPAIGNS,
+        campaigns,
+        CACHE_TTL.DEFAULT
+      );
+
+      // También guardar listas filtradas
+      const cabañas = campaigns.filter((c) => c.accommodationType === "Cabaña");
+      const hostales = campaigns.filter(
+        (c) => c.accommodationType === "Hostal"
+      );
+
+      await cacheService.set(
+        CACHE_KEYS.CABINS_ONLY,
+        cabañas,
+        CACHE_TTL.DEFAULT
+      );
+      await cacheService.set(
+        CACHE_KEYS.HOSTELS_ONLY,
+        hostales,
+        CACHE_TTL.DEFAULT
+      );
+
+      return campaigns;
     } catch (error) {
-      console.error(`Error al obtener la cabaña con slug ${slug}:`, error);
+      console.error("Error al obtener los alojamientos:", error);
+      throw new Error(
+        "Error al obtener los alojamientos desde Notion: " + error.message
+      );
+    }
+  }
+
+  async getCabinsByType(type) {
+    try {
+      const cacheKey =
+        type === "Cabaña" ? CACHE_KEYS.CABINS_ONLY : CACHE_KEYS.HOSTELS_ONLY;
+
+      // Intentar obtener desde caché
+      const cachedCampaigns = await cacheService.get(cacheKey);
+      if (cachedCampaigns) {
+        return cachedCampaigns;
+      }
+
+      // Si no está en caché, obtener todos y filtrar
+      const allCampaigns = await this.getAllCampaigns();
+      const filteredCampaigns = allCampaigns.filter(
+        (c) => c.accommodationType === type
+      );
+
+      // Guardar en caché
+      await cacheService.set(cacheKey, filteredCampaigns, CACHE_TTL.DEFAULT);
+
+      return filteredCampaigns;
+    } catch (error) {
+      console.error(`Error al obtener alojamientos de tipo ${type}:`, error);
+      throw new Error(
+        `Error al obtener alojamientos de tipo ${type}: ${error.message}`
+      );
+    }
+  }
+
+// Método auxiliar para enriquecer campañas con su estado
+async enrichCampaignsWithStatus(campaigns) {
+  try {
+    // Usar Promise.allSettled para manejar errores en promesas individuales
+    const results = await Promise.allSettled(campaigns.map(async (campaign) => {
+      try {
+        // Determinar el estado actual del alojamiento
+        campaign.reservationStatus = await this.determineReservationStatus(campaign.id);
+
+        // Calcular camas disponibles para hostales
+        if (campaign.accommodationType === "Hostal") {
+          campaign.availableBeds = await this.calculateAvailableBeds(
+            campaign.id,
+            campaign.totalCapacity
+          );
+          campaign.occupiedBeds = campaign.totalCapacity - campaign.availableBeds;
+        }
+
+        return campaign;
+      } catch (error) {
+        console.error(`Error al enriquecer campaña ${campaign.id}:`, error);
+        // Asignar valores por defecto en caso de error
+        campaign.reservationStatus = "Desconocido";
+        if (campaign.accommodationType === "Hostal") {
+          campaign.availableBeds = 0;
+          campaign.occupiedBeds = campaign.totalCapacity || 0;
+        }
+        return campaign;
+      }
+    }));
+
+    // Procesar los resultados para mantener el orden original
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        campaigns[index] = result.value;
+      }
+      // Si está rechazado, la campaña ya fue actualizada en el bloque try/catch interno
+    });
+  } catch (error) {
+    console.error('Error general al enriquecer campañas:', error);
+  }
+}
+
+  async getCampaignById(cabinId) {
+    try {
+      // Intentar obtener desde caché
+      const cacheKey = CACHE_KEYS.CAMPAIGN_DETAIL(cabinId);
+      const cachedCampaign = await cacheService.get(cacheKey);
+      if (cachedCampaign) {
+        return cachedCampaign;
+      }
+
+      // Consultar a Notion con reintentos
+      const fetchFromNotion = withRetry(async () => {
+        const response = await notion.pages.retrieve({
+          page_id: cabinId,
+        });
+        return response;
+      });
+
+      const response = await fetchFromNotion();
+      const campaign = this.formatCampaign(response);
+
+      // Determinar el estado actual del alojamiento
+      campaign.reservationStatus = await this.determineReservationStatus(
+        campaign.id
+      );
+
+      // Calcular camas disponibles para hostales
+      if (campaign.accommodationType === "Hostal") {
+        campaign.availableBeds = await this.calculateAvailableBeds(
+          campaign.id,
+          campaign.totalCapacity
+        );
+        campaign.occupiedBeds = campaign.totalCapacity - campaign.availableBeds;
+      }
+
+      // Guardar en caché
+      await cacheService.set(cacheKey, campaign, CACHE_TTL.DEFAULT);
+
+      return campaign;
+    } catch (error) {
+      console.error(
+        `Error al obtener el alojamiento con ID ${cabinId}:`,
+        error
+      );
+      throw new Error(`Error al buscar alojamiento con ID: ${cabinId}`);
+    }
+  }
+
+  async getAvailableCampaigns(filterType = null) {
+    try {
+      console.log("Buscando campañas disponibles...");
+      
+      const allCampaigns = await this.getAllCampaigns();
+      console.log(`Total de campañas obtenidas: ${allCampaigns.length}`);
+      
+      const availableCampaigns = [];
+      
+      for (const campaign of allCampaigns) {
+        console.log(`Evaluando campaña: ${campaign.name}, Tipo: ${campaign.accommodationType}, Estado: ${campaign.reservationStatus}`);
+        
+        if (filterType && campaign.accommodationType !== filterType) {
+          console.log(`  - Filtrada por tipo (${filterType})`);
+          continue;
+        }
+        
+        if (campaign.accommodationType === 'Hostal') {
+          console.log(`  - Es hostal con ${campaign.availableBeds} camas disponibles`);
+          if (campaign.availableBeds > 0) {
+            availableCampaigns.push(campaign);
+            console.log(`  - Agregada a disponibles`);
+          }
+        } else {
+          // Para cabañas, considerar disponibles si el estado es 'Disponible' o 'Desconocido'
+          if (campaign.reservationStatus === 'Disponible' || campaign.reservationStatus === 'Desconocido') {
+            console.log(`  - Es cabaña disponible o con estado desconocido`);
+            availableCampaigns.push(campaign);
+            console.log(`  - Agregada a disponibles`);
+          }
+        }
+      }
+  
+      console.log(`Campañas disponibles encontradas: ${availableCampaigns.length}`);
+      return availableCampaigns;
+    } catch (error) {
+      console.error('Error al obtener los alojamientos disponibles:', error);
+      throw new Error('Error al obtener los alojamientos disponibles');
+    }
+  }
+
+  async getReservedCampaigns(filterType = null) {
+    try {
+      // Clave de caché específica según filtro
+      let cacheKey = CACHE_KEYS.RESERVED_CAMPAIGNS;
+      if (filterType) {
+        cacheKey = `${cacheKey}:${filterType}`;
+      }
+
+      // Intentar obtener desde caché
+      const cachedCampaigns = await cacheService.get(cacheKey);
+      if (cachedCampaigns) {
+        return cachedCampaigns;
+      }
+
+      // Obtener todas las campañas
+      const allCampaigns = await this.getAllCampaigns();
+      const reservedCampaigns = [];
+
+      // Filtrar solo los alojamientos reservados u ocupados
+      for (const campaign of allCampaigns) {
+        // Aplicar filtro por tipo si está definido
+        if (filterType && campaign.accommodationType !== filterType) {
+          continue;
+        }
+
+        // Para hostales, verificar si tienen camas ocupadas
+        if (campaign.accommodationType === "Hostal") {
+          if (campaign.occupiedBeds > 0) {
+            reservedCampaigns.push(campaign);
+          }
+        } else if (
+          campaign.reservationStatus === "Reservada" ||
+          campaign.reservationStatus === "Ocupada"
+        ) {
+          // Para cabañas, verificar estado de reserva
+          reservedCampaigns.push(campaign);
+        }
+      }
+
+      // Guardar en caché
+      await cacheService.set(cacheKey, reservedCampaigns, CACHE_TTL.SHORT);
+
+      return reservedCampaigns;
+    } catch (error) {
+      console.error("Error al obtener los alojamientos reservados:", error);
+      throw new Error(
+        "Error al obtener los alojamientos reservados: " + error.message
+      );
+    }
+  }
+
+  async getCampaignBySlug(slug) {
+    try {
+      // Intentar obtener desde caché
+      const cacheKey = `campaign:slug:${slug}`;
+      const cachedCampaign = await cacheService.get(cacheKey);
+      if (cachedCampaign) {
+        return cachedCampaign;
+      }
+  
+      // Ejecutar la consulta a través de la cola
+      const queryNotionWithQueue = async () => {
+        // Función de reintento
+        const retry = async (fn, maxRetries = 5) => {
+          let lastError;
+          for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+              return await fn();
+            } catch (error) {
+              lastError = error;
+              if (error.code === 'rate_limited') {
+                const retryAfter = error.headers ? 
+                  parseInt(error.headers.get('retry-after') || '60', 10) * 1000 : 
+                  Math.min(Math.pow(2, attempt) * 1000, 30000);
+                
+                console.log(`Rate limited en getCampaignBySlug. Esperando ${retryAfter/1000} segundos antes de reintentar (intento ${attempt}/${maxRetries})...`);
+                await new Promise(resolve => setTimeout(resolve, retryAfter));
+              } else {
+                const backoff = Math.min(Math.pow(2, attempt) * 100, 5000);
+                console.warn(`Error en intento ${attempt}/${maxRetries}: ${error.message}. Reintentando en ${backoff}ms...`);
+                await new Promise(resolve => setTimeout(resolve, backoff));
+                if (attempt === maxRetries) throw lastError;
+              }
+            }
+          }
+          throw lastError;
+        };
+  
+        // Ejecutar consulta a Notion con reintentos
+        const response = await retry(async () => {
+          return await notion.databases.query({
+            database_id: campaignsDatabaseId,
+            filter: {
+              property: "slug",
+              rich_text: {
+                equals: slug,
+              },
+            },
+          });
+        });
+        
+        if (response.results.length === 0) {
+          throw new Error(`No se encontró el alojamiento con el slug ${slug}`);
+        }
+  
+        return response;
+      };
+  
+      // Usar la cola para la consulta principal
+      const response = await notionQueue.enqueue(queryNotionWithQueue);
+      const pageData = this.formatCampaign(response.results[0]);
+  
+      // Determinar el estado actual del alojamiento (usar cola)
+      pageData.reservationStatus = await notionQueue.enqueue(() => 
+        this.determineReservationStatus(pageData.id)
+      );
+  
+      // Calcular camas disponibles para hostales (usar cola)
+      if (pageData.accommodationType === "Hostal") {
+        pageData.availableBeds = await notionQueue.enqueue(() => 
+          this.calculateAvailableBeds(pageData.id, pageData.totalCapacity)
+        );
+        pageData.occupiedBeds = pageData.totalCapacity - pageData.availableBeds;
+      }
+  
+      // Obtener el contenido de la página (usar cola)
+      const pageContent = await notionQueue.enqueue(() => 
+        this.getPageContent(pageData.id)
+      );
+  
+      // Obtener las reservas (usar cola)
+      const reservations = await notionQueue.enqueue(() =>
+        horariosService.getHorariosByCabana(pageData.id)
+      );
+  
+      // Agregar el contenido y las reservas a los datos de la página
+      const result = {
+        ...pageData,
+        content: pageContent,
+        reservations,
+      };
+  
+      // Guardar en caché por un tiempo mayor (30 minutos)
+      await cacheService.set(cacheKey, result, 1800);
+  
+      return result;
+    } catch (error) {
+      console.error(`Error al obtener el alojamiento con slug ${slug}:`, error);
       throw error;
     }
   }
 
-  // Agrega este método a tu CampaignService
+  async createCampaign(campaignData) {
+    try {
+        const { 
+            name, 
+            slug, 
+            accommodationType, 
+            totalCapacity,     
+            category, 
+            bathrooms,
+            priceNight,  // 🔹 Asegurar que se recibe PriceNight
+            amenities, 
+            direction, 
+            linkMaps, 
+            banner
+        } = campaignData;
 
-/**
- * Crea una nueva cabaña en la base de datos de Notion
- * @param {Object} campaignData - Datos de la cabaña a crear
- * @returns {Object} La cabaña creada y formateada
- */
-async createCampaign(campaignData) {
-    try {
-      const { 
-        name, 
-        slug, 
-        nrBeds, 
-        category, 
-        amenities, 
-        direction, 
-        linkMaps, 
-        banner
-      } = campaignData;
-      
-      // Validar campos requeridos
-      if (!name || !slug) {
-        throw new Error('El nombre de la cabaña y el slug son obligatorios');
-      }
-      
-      // Verificar si el slug ya existe
-      const existingCampaign = await this.checkSlugExists(slug);
-      if (existingCampaign) {
-        throw new Error(`Ya existe una cabaña con el slug: ${slug}`);
-      }
-      
-      // Preparar las propiedades para la creación
-      const properties = {
-        'Name': {
-          title: [
-            {
-              text: {
-                content: name
-              }
+        // Validar campos requeridos
+        if (!name || !slug) {
+            throw new Error('El nombre de la cabaña y el slug son obligatorios');
+        }
+
+        // Verificar si el slug ya existe
+        const existingCampaign = await this.checkSlugExists(slug);
+        if (existingCampaign) {
+            throw new Error(`Ya existe un alojamiento con el slug: ${slug}`);
+        }
+
+        // Preparar las propiedades para la creación
+        const properties = {
+            'Name': { 
+                title: [{ text: { content: name } }]
+            },
+            'slug': { 
+                rich_text: [{ text: { content: slug } }]
+            },
+            'AccommodationType': { 
+                select: { name: accommodationType }
+            },
+            'TotalCapacity': { 
+                number: totalCapacity 
+            },
+            'Category': { 
+                select: { name: category }
+            },
+            'direction': { 
+                rich_text: [{ text: { content: direction } }]
+            },
+            'linkMaps': { 
+                url: linkMaps 
+            },
+            'banner': { 
+                url: banner 
             }
-          ]
-        },
-        'slug': {
-          rich_text: [
-            {
-              text: {
-                content: slug
-              }
-            }
-          ]
-        },
-        'reservation_status': {
-          select: {
-            name: 'Disponible'
-          }
+        };
+
+        // 🔹 Corregir bathrooms si existe
+        if (bathrooms !== undefined) {
+            properties['bathrooms'] = { number: bathrooms };
         }
-      };
-      
-      // Agregar propiedades opcionales si están presentes
-      if (nrBeds !== undefined) {
-        properties['NrBeds'] = {
-          number: nrBeds
-        };
-      }
-      
-      if (category) {
-        properties['Category'] = {
-          select: {
-            name: category
-          }
-        };
-      }
-      
-      if (amenities) {
-        if (amenities.gym !== undefined) {
-          properties['gym'] = {
-            checkbox: amenities.gym
-          };
+
+        // 🔹 Incluir PriceNight si está en el request
+        if (priceNight !== undefined) {
+            properties['PriceNight'] = { number: priceNight };
         }
-        
-        if (amenities.skiroom !== undefined) {
-          properties['skiroom'] = {
-            checkbox: amenities.skiroom
-          };
+
+        // 🔹 Agregar amenities correctamente
+        if (amenities) {
+            if (amenities.gym !== undefined) properties['gym'] = { checkbox: amenities.gym };
+            if (amenities.skiroom !== undefined) properties['skiroom'] = { checkbox: amenities.skiroom };
+            if (amenities.food !== undefined) properties['food'] = { checkbox: amenities.food };
         }
-        
-        if (amenities.food !== undefined) {
-          properties['food'] = {
-            checkbox: amenities.food
-          };
-        }
-      }
-      
-      if (direction) {
-        properties['direction'] = {
-          rich_text: [
-            {
-              text: {
-                content: direction
-              }
-            }
-          ]
-        };
-      }
-      
-      if (linkMaps) {
-        properties['linkMaps'] = {
-          url: linkMaps
-        };
-      }
-      
-      if (banner) {
-        properties['banner'] = {
-          url: banner
-        };
-      }
-      
-      // Crear la página en Notion
-      const response = await notion.pages.create({
-        parent: {
-          database_id: campaignsDatabaseId
-        },
-        properties
-      });
-      
-      return this.formatCampaign(response);
+
+        // Crear la página en Notion con reintentos
+        const createInNotion = withRetry(async () => {
+            return await notion.pages.create({
+                parent: { database_id: campaignsDatabaseId },
+                properties
+            });
+        });
+
+        const response = await createInNotion();
+        return this.formatCampaign(response);
+
     } catch (error) {
-      console.error('Error al crear cabaña en Notion:', error);
-      throw new Error(`Error al crear cabaña: ${error.message}`);
+        console.error('Error al crear alojamiento en Notion:', error);
+        throw new Error(`Error al crear alojamiento: ${error.message}`);
     }
-  }
-  
-  /**
-   * Verifica si ya existe una cabaña con el slug proporcionado
-   * @param {string} slug - El slug a verificar
-   * @returns {boolean} - Verdadero si ya existe una cabaña con ese slug
-   */
-  async checkSlugExists(slug) {
-    try {
-      const response = await notion.databases.query({
-        database_id: campaignsDatabaseId,
+}
+
+
+async checkSlugExists(slug) {
+  try {
+    // Implementar función de reintentos para manejar límites de tasa
+    const retryOperation = async (operation, maxRetries = 5, delay = 500) => {
+      let lastError;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          return await operation();
+        } catch (error) {
+          lastError = error;
+
+          // Si el error es "rate_limited", espera más tiempo antes de reintentar
+          if (error.code === 'rate_limited') {
+            const waitTime = delay * Math.pow(2, attempt - 1); // Backoff exponencial
+            console.warn(`Intento ${attempt} fallido por rate limit. Esperando ${waitTime}ms`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+          } else {
+            console.warn(`Intento ${attempt} fallido:`, error.message);
+            if (attempt === maxRetries) throw error;
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+        }
+      }
+      throw lastError;
+    };
+    
+    const response = await retryOperation(async () => {
+      return await notion.databases.query({
+        database_id: campaignsDatabaseId, // Usar campaignsDatabaseId en lugar de databaseId
         filter: {
-          property: 'slug',
+          property: 'slug', // Asegúrate de que el nombre de la propiedad sea exactamente como aparece en Notion
           rich_text: {
             equals: slug
           }
         }
       });
-      
-      return response.results.length > 0;
-    } catch (error) {
-      console.error(`Error al verificar slug ${slug}:`, error);
-      throw new Error(`Error al verificar slug: ${error.message}`);
-    }
+    });
+    
+    return response.results.length > 0;
+  } catch (error) {
+    console.error(`Error al verificar slug ${slug}:`, error);
+    throw new Error(`Error al verificar slug: ${error.message}`);
   }
+}
 
-  /**
-   * Actualiza el estado de reserva de una cabaña
-   */
-  async updateCampaignReservation(cabinId, data) {
+  async updateCampaign(cabinId, data) {
     try {
-      const { teamId, reservationStatus, checkInDate, checkOutDate } = data;
-      
+      const {
+        name,
+        accommodationType,
+        totalCapacity,
+        category,
+        amenities,
+        direction,
+        linkMaps,
+        banner,
+      } = data;
+
       const properties = {};
-      
-      if (reservationStatus) {
-        properties['reservation_status'] = {
-          select: {
-            name: reservationStatus // "Disponible", "Reservada", "Ocupada", "Finalizada"
-          }
-        };
-      }
-      
-      if (teamId) {
-        properties['team_assigned'] = {
-          relation: [{
-            id: teamId
-          }]
-        };
-      } else {
-        // Si no hay team_id, eliminamos la relación
-        properties['team_assigned'] = {
-          relation: []
-        };
-      }
-      
-      if (checkInDate) {
-        properties['check_in_date'] = {
-          date: {
-            start: checkInDate
-          }
-        };
-      } else {
-        properties['check_in_date'] = {
-          date: null
-        };
-      }
-      
-      if (checkOutDate) {
-        properties['check_out_date'] = {
-          date: {
-            start: checkOutDate
-          }
-        };
-      } else {
-        properties['check_out_date'] = {
-          date: null
+
+      if (name) {
+        properties["Name"] = {
+          title: [
+            {
+              text: {
+                content: name,
+              },
+            },
+          ],
         };
       }
 
-      const response = await notion.pages.update({
-        page_id: cabinId,
-        properties
+      if (accommodationType) {
+        properties["AccommodationType"] = {
+          select: {
+            name: accommodationType,
+          },
+        };
+      }
+
+      if (totalCapacity !== undefined) {
+        properties["TotalCapacity"] = {
+          number: totalCapacity,
+        };
+      }
+
+      if (category) {
+        properties["Category"] = {
+          select: {
+            name: category,
+          },
+        };
+      }
+
+      if (amenities) {
+        if (amenities.gym !== undefined) {
+          properties["gym"] = {
+            checkbox: amenities.gym,
+          };
+        }
+
+        if (amenities.skiroom !== undefined) {
+          properties["skiroom"] = {
+            checkbox: amenities.skiroom,
+          };
+        }
+
+        if (amenities.food !== undefined) {
+          properties["food"] = {
+            checkbox: amenities.food,
+          };
+        }
+      }
+
+      if (direction) {
+        properties["direction"] = {
+          rich_text: [
+            {
+              text: {
+                content: direction,
+              },
+            },
+          ],
+        };
+      }
+
+      if (linkMaps) {
+        properties["linkMaps"] = {
+          url: linkMaps,
+        };
+      }
+
+      if (banner) {
+        properties["banner"] = {
+          url: banner,
+        };
+      }
+
+      // Actualizar página en Notion con reintentos
+      const updateInNotion = withRetry(async () => {
+        return await notion.pages.update({
+          page_id: cabinId,
+          properties,
+        });
       });
 
-      return this.formatCampaign(response);
+      const response = await updateInNotion();
+
+      const campaign = this.formatCampaign(response);
+      campaign.reservationStatus = await this.determineReservationStatus(
+        campaign.id
+      );
+
+      // Calcular camas disponibles para hostales
+      if (campaign.accommodationType === "Hostal") {
+        campaign.availableBeds = await this.calculateAvailableBeds(
+          campaign.id,
+          campaign.totalCapacity
+        );
+        campaign.occupiedBeds = campaign.totalCapacity - campaign.availableBeds;
+      }
+
+      // Invalidar caché para este alojamiento y cachés globales
+      await this.invalidateCache(cabinId);
+
+      return campaign;
     } catch (error) {
-      console.error(`Error al actualizar la reserva de la cabaña ${cabinId}:`, error);
-      throw new Error('Error al actualizar la reserva de la cabaña');
+      console.error(`Error al actualizar el alojamiento ${cabinId}:`, error);
+      throw new Error("Error al actualizar el alojamiento: " + error.message);
     }
   }
 
-  /**
-   * Formatea una sola cabaña
-   */
-  formatCampaign(page) {
-    return this.formatCampaigns([page])[0];
+  async determineReservationStatus(cabinId) {
+    try {
+      const cacheKey = CACHE_KEYS.CAMPAIGN_STATUS(cabinId);
+      const cachedStatus = await cacheService.get(cacheKey);
+      if (cachedStatus) return cachedStatus;
+  
+      // Consulta directa a Notion sin usar getCampaignById para evitar recursión
+      const campaignResponse = await notion.pages.retrieve({
+        page_id: cabinId
+      });
+      
+      const campaign = this.formatCampaign(campaignResponse);
+      const currentDate = new Date().toISOString().split('T')[0];
+      
+      let status;
+      
+      if (campaign.accommodationType === 'Hostal') {
+        // Calcular directamente sin llamar a calculateAvailableBeds (que podría causar más recursión)
+        const activeReservations = await notion.databases.query({
+          database_id: process.env.NOTION_HORARIOS_DATABASE_ID,
+          filter: {
+            and: [
+              { property: 'Cabañas', relation: { contains: cabinId } },
+              { property: 'Check-in', date: { on_or_before: currentDate } },
+              { property: 'Check-out', date: { on_or_after: currentDate } },
+              { property: 'Estado', select: { equals: 'Confirmada' } }
+            ]
+          }
+        });
+        
+        let occupiedBeds = 0;
+        for (const reservation of activeReservations.results) {
+          const numBeds = reservation.properties.NrBeds?.number || 1;
+          occupiedBeds += numBeds;
+        }
+        
+        const availableBeds = Math.max(0, campaign.totalCapacity - occupiedBeds);
+        
+        if (availableBeds === 0) {
+          status = 'Completo';
+        } else if (availableBeds < campaign.totalCapacity) {
+          status = 'Parcialmente Ocupado';
+        } else {
+          status = 'Disponible';
+        }
+      } else {
+        // Para cabañas, verificamos si hay reservas activas
+        const activeReservations = await notion.databases.query({
+          database_id: process.env.NOTION_HORARIOS_DATABASE_ID,
+          filter: {
+            and: [
+              { property: 'Cabañas', relation: { contains: cabinId } },
+              { property: 'Check-in', date: { on_or_before: currentDate } },
+              { property: 'Check-out', date: { on_or_after: currentDate } },
+              { property: 'Estado', select: { equals: 'Confirmada' } }
+            ]
+          }
+        });
+        
+        if (activeReservations.results.length > 0) {
+          status = 'Ocupada';
+        } else {
+          const futureReservations = await notion.databases.query({
+            database_id: process.env.NOTION_HORARIOS_DATABASE_ID,
+            filter: {
+              and: [
+                { property: 'Cabañas', relation: { contains: cabinId } },
+                { property: 'Check-in', date: { after: currentDate } },
+                { property: 'Estado', select: { equals: 'Confirmada' } }
+              ]
+            }
+          });
+          
+          status = futureReservations.results.length > 0 ? 'Reservada' : 'Disponible';
+        }
+      }
+      
+      await cacheService.set(cacheKey, status, CACHE_TTL.VERY_SHORT);
+      return status;
+    } catch (error) {
+      console.error(`Error al determinar estado de ${cabinId}:`, error);
+      return 'Disponible'; // Por defecto considerar disponible en caso de error
+    }
   }
 
-  /**
-   * Obtiene el contenido de una página de Notion
-   */
+async calculateAvailableBeds(hostalId, totalCapacity) {
+  try {
+      const cacheKey = CACHE_KEYS.CAMPAIGN_BEDS(hostalId);
+      const cachedAvailableBeds = await cacheService.get(cacheKey);
+      if (cachedAvailableBeds !== null) return parseInt(cachedAvailableBeds);
+
+      const currentDate = new Date().toISOString().split('T')[0];
+
+      const activeReservations = await notion.databases.query({
+          database_id: process.env.NOTION_HORARIOS_DATABASE_ID,
+          filter: {
+              and: [
+                  { property: 'Cabañas', relation: { contains: hostalId } },
+                  { property: 'Check-in', date: { on_or_before: currentDate } },
+                  { property: 'Check-out', date: { on_or_after: currentDate } },
+                  { property: 'Estado', select: { equals: 'Confirmada' } }
+              ]
+          }
+      });
+
+      let occupiedBeds = 0;
+      for (const reservation of activeReservations.results) {
+          const numBeds = reservation.properties.NrBeds?.number || 1;
+          occupiedBeds += numBeds;
+      }
+
+      const availableBeds = Math.max(0, totalCapacity - occupiedBeds);
+      await cacheService.set(cacheKey, availableBeds.toString(), CACHE_TTL.VERY_SHORT);
+
+      return availableBeds;
+  } catch (error) {
+      console.error(`Error al calcular camas disponibles para ${hostalId}:`, error);
+      return 0;
+  }
+}
+
+
   async getPageContent(pageId) {
     try {
-      // Obtener los bloques de la página
-      const blocks = await notion.blocks.children.list({
-        block_id: pageId,
+      // Obtener los bloques de la página con reintentos
+      const getBlocksWithRetry = withRetry(async () => {
+        return await notion.blocks.children.list({
+          block_id: pageId,
+        });
       });
+
+      const blocks = await getBlocksWithRetry();
 
       // Procesar y formatear los bloques
       return this.formatBlocks(blocks.results);
     } catch (error) {
-      console.error(`Error al obtener el contenido de la página ${pageId}:`, error);
+      console.error(
+        `Error al obtener el contenido de la página ${pageId}:`,
+        error
+      );
       return [];
     }
   }
 
-  /**
-   * Formatea los bloques de contenido de Notion
-   */
   formatBlocks(blocks) {
-    return blocks.map(block => {
+    return blocks.map((block) => {
       // Formateamos según el tipo de bloque
       switch (block.type) {
-        case 'paragraph':
+        case "paragraph":
           return {
-            type: 'paragraph',
+            type: "paragraph",
             id: block.id,
-            text: block.paragraph.rich_text.map(t => t.plain_text).join('')
+            text: block.paragraph.rich_text.map((t) => t.plain_text).join(""),
           };
-        case 'heading_1':
+        case "heading_1":
           return {
-            type: 'heading_1',
+            type: "heading_1",
             id: block.id,
-            text: block.heading_1.rich_text.map(t => t.plain_text).join('')
+            text: block.heading_1.rich_text.map((t) => t.plain_text).join(""),
           };
-        case 'heading_2':
+        case "heading_2":
           return {
-            type: 'heading_2',
+            type: "heading_2",
             id: block.id,
-            text: block.heading_2.rich_text.map(t => t.plain_text).join('')
+            text: block.heading_2.rich_text.map((t) => t.plain_text).join(""),
           };
-        case 'heading_3':
+        case "heading_3":
           return {
-            type: 'heading_3',
+            type: "heading_3",
             id: block.id,
-            text: block.heading_3.rich_text.map(t => t.plain_text).join('')
+            text: block.heading_3.rich_text.map((t) => t.plain_text).join(""),
           };
-        case 'bulleted_list_item':
+        case "bulleted_list_item":
           return {
-            type: 'bulleted_list_item',
+            type: "bulleted_list_item",
             id: block.id,
-            text: block.bulleted_list_item.rich_text.map(t => t.plain_text).join('')
+            text: block.bulleted_list_item.rich_text
+              .map((t) => t.plain_text)
+              .join(""),
           };
-        case 'numbered_list_item':
+        case "numbered_list_item":
           return {
-            type: 'numbered_list_item',
+            type: "numbered_list_item",
             id: block.id,
-            text: block.numbered_list_item.rich_text.map(t => t.plain_text).join('')
+            text: block.numbered_list_item.rich_text
+              .map((t) => t.plain_text)
+              .join(""),
           };
-        case 'to_do':
+        case "to_do":
           return {
-            type: 'to_do',
+            type: "to_do",
             id: block.id,
-            text: block.to_do.rich_text.map(t => t.plain_text).join(''),
-            checked: block.to_do.checked
+            text: block.to_do.rich_text.map((t) => t.plain_text).join(""),
+            checked: block.to_do.checked,
           };
-        case 'toggle':
+        case "toggle":
           return {
-            type: 'toggle',
+            type: "toggle",
             id: block.id,
-            text: block.toggle.rich_text.map(t => t.plain_text).join('')
+            text: block.toggle.rich_text.map((t) => t.plain_text).join(""),
           };
-        case 'child_page':
+        case "child_page":
           return {
-            type: 'child_page',
+            type: "child_page",
             id: block.id,
-            title: block.child_page.title
+            title: block.child_page.title,
           };
-        case 'image':
+        case "image":
           return {
-            type: 'image',
+            type: "image",
             id: block.id,
-            url: block.image.type === 'external' ? block.image.external.url : block.image.file.url,
-            caption: block.image.caption ? block.image.caption.map(t => t.plain_text).join('') : ''
+            url:
+              block.image.type === "external"
+                ? block.image.external.url
+                : block.image.file.url,
+            caption: block.image.caption
+              ? block.image.caption.map((t) => t.plain_text).join("")
+              : "",
           };
-        case 'divider':
+        case "divider":
           return {
-            type: 'divider',
-            id: block.id
-          };
-        case 'quote':
-          return {
-            type: 'quote',
+            type: "divider",
             id: block.id,
-            text: block.quote.rich_text.map(t => t.plain_text).join('')
           };
-        case 'code':
+        case "quote":
           return {
-            type: 'code',
+            type: "quote",
             id: block.id,
-            text: block.code.rich_text.map(t => t.plain_text).join(''),
-            language: block.code.language
+            text: block.quote.rich_text.map((t) => t.plain_text).join(""),
           };
-        case 'file':
+        case "code":
           return {
-            type: 'file',
+            type: "code",
             id: block.id,
-            url: block.file.type === 'external' ? block.file.external.url : block.file.file.url,
-            name: block.file.caption ? block.file.caption.map(t => t.plain_text).join('') : 'File'
+            text: block.code.rich_text.map((t) => t.plain_text).join(""),
+            language: block.code.language,
           };
-        case 'bookmark':
+        case "file":
           return {
-            type: 'bookmark',
+            type: "file",
+            id: block.id,
+            url:
+              block.file.type === "external"
+                ? block.file.external.url
+                : block.file.file.url,
+            name: block.file.caption
+              ? block.file.caption.map((t) => t.plain_text).join("")
+              : "File",
+          };
+        case "bookmark":
+          return {
+            type: "bookmark",
             id: block.id,
             url: block.bookmark.url,
-            caption: block.bookmark.caption ? block.bookmark.caption.map(t => t.plain_text).join('') : ''
+            caption: block.bookmark.caption
+              ? block.bookmark.caption.map((t) => t.plain_text).join("")
+              : "",
           };
-        case 'table':
+        case "table":
           return {
-            type: 'table',
-            id: block.id
+            type: "table",
+            id: block.id,
           };
         default:
           return {
             type: block.type,
             id: block.id,
-            unsupported: true
+            unsupported: true,
           };
       }
     });
   }
 
-  /**
-   * Formatea los datos de una cabaña desde el formato de Notion al formato deseado por la API
-   */
-  formatCampaigns(pages) {
-    return pages.map(page => {
-      const properties = page.properties;
-
-      // Obtener el equipo asignado, si existe
-      let teamAssigned = null;
-      if (properties.team_assigned?.relation && properties.team_assigned.relation.length > 0) {
-        teamAssigned = properties.team_assigned.relation[0].id;
-      }
-
-      return {
-        id: page.id,
-        name: properties.Name?.title?.map(title => title.plain_text).join('') || '',
-        slug: properties.slug?.rich_text?.map(text => text.plain_text).join('') || '',
-        nrBeds: properties.NrBeds?.number || 0,
-        category: properties.Category?.select?.name || '',
-        amenities: {
-          gym: properties.gym?.checkbox || false,
-          skiroom: properties.skiroom?.checkbox || false,
-          food: properties.food?.checkbox || false,
-        },
-        teamAssigned,
-        reservationStatus: properties.reservation_status?.select?.name || 'Disponible',
-        checkInDate: properties.check_in_date?.date?.start || null,
-        checkOutDate: properties.check_out_date?.date?.start || null,
-        direction: properties.direction?.rich_text?.map(text => text.plain_text).join('') || '',
-        linkMaps: properties.linkMaps?.url || '',
-        admin: properties.Admin?.people?.map(person => ({
-          id: person.id,
-          name: person.name,
-          avatarUrl: person.avatar_url,
-        })) || [],
-        banner: properties.banner?.url || '',
-        lastEditedTime: page.last_edited_time
-      };
-    });
+  formatCampaign(page) {
+    return this.formatCampaigns([page])[0];
   }
+
+// Corregir en la función formatCampaigns
+formatCampaigns(pages) {
+  return pages.map((page) => {
+    const properties = page.properties;
+
+    return {
+      id: page.id,
+      name: properties.Name?.title?.map(title => title.plain_text).join('') || '',
+      slug: properties.slug?.rich_text?.map(text => text.plain_text).join('') || '',
+      // Usar accommodationType en lugar de Category
+      accommodationType: properties.AccommodationType?.select?.name || 'Cabaña',
+      // Usar totalCapacity en lugar de NrBeds
+      totalCapacity: properties.TotalCapacity?.number || 0,
+      bathrooms: properties.bathrooms?.number || 0,
+      pricePerNight: properties.PriceNight?.number || 0,
+      direction: properties.direction?.rich_text?.map(text => text.plain_text).join('') || '',
+      linkMaps: properties.linkMaps?.url || '',
+      wifi: properties.Wifi?.checkbox || false,
+      kitchen: properties.Kitchen?.checkbox || false,
+      gym: properties.gym?.checkbox || false,
+      skiroom: properties.skiroom?.checkbox || false,
+      food: properties.food?.checkbox || false,
+      admin: properties.Admin?.people?.map(person => ({
+        id: person.id,
+        name: person.name,
+        avatarUrl: person.avatar_url
+      })) || [],
+      banner: properties.banner?.url || '',
+      images: [
+        properties.ImageCover1?.url || '',
+        properties.ImageCover2?.url || '',
+        properties.ImageCover3?.url || ''
+      ].filter(img => img !== ''),
+      lastEditedTime: page.last_edited_time
+    };
+  });
 }
 
-module.exports = new CampaignService();
+  // Método para invalidar la caché específica de un alojamiento
+  async invalidateCache(cabinId) {
+    try {
+      // Eliminar las claves específicas
+      await cacheService.del(CACHE_KEYS.CAMPAIGN_STATUS(cabinId));
+      await cacheService.del(CACHE_KEYS.CAMPAIGN_BEDS(cabinId));
+      await cacheService.del(CACHE_KEYS.CAMPAIGN_DETAIL(cabinId));
+
+      // También invalidar las cachés globales
+      await this.invalidateGlobalCache();
+
+      return true;
+    } catch (error) {
+      console.error(`Error al invalidar caché para ${cabinId}:`, error);
+      return false;
+    }
+  }
+
+  // Método para invalidar todas las cachés globales
+  async invalidateGlobalCache() {
+    try {
+      // Eliminar las cachés globales
+      await cacheService.del(CACHE_KEYS.ALL_CAMPAIGNS);
+      await cacheService.del(CACHE_KEYS.AVAILABLE_CAMPAIGNS);
+      await cacheService.del(CACHE_KEYS.RESERVED_CAMPAIGNS);
+      await cacheService.del(CACHE_KEYS.CABINS_ONLY);
+      await cacheService.del(CACHE_KEYS.HOSTELS_ONLY);
+
+      // También eliminar las cachés con filtros
+      await cacheService.delByPattern(`${CACHE_KEYS.AVAILABLE_CAMPAIGNS}:*`);
+      await cacheService.delByPattern(`${CACHE_KEYS.RESERVED_CAMPAIGNS}:*`);
+
+      return true;
+    } catch (error) {
+      console.error("Error al invalidar caché global:", error);
+      return false;
+    }
+  }
+
+  async updateAvailableBeds(hostalId, availableBeds, dateRange = null) {
+    try {
+      if (dateRange) {
+        const cacheKey = `hostal:${hostalId}:bookings`;
+        let bookings = await cacheService.get(cacheKey) || {};
+        
+        const dateKey = `${dateRange.from}_${dateRange.to}`;
+        bookings[dateKey] = {
+          from: dateRange.from,
+          to: dateRange.to,
+          bookedBeds: dateRange.beds
+        };
+        
+        await cacheService.set(cacheKey, bookings, CACHE_TTL.LONG);
+      }
+      
+      await notion.pages.update({
+        page_id: hostalId,
+        properties: {
+          "availableBeds": {
+            number: availableBeds
+          }
+        }
+      });
+      
+      await this.invalidateCache(hostalId);
+      return true;
+    } catch (error) {
+      console.error(`Error al actualizar camas disponibles para ${hostalId}:`, error);
+      throw new Error(`No se pudo actualizar las camas disponibles: ${error.message}`);
+    }
+  }
+}
+module.exports = new campaignService();
+
+
+const campaignServiceInstance = new campaignService();
+serviceResolver.registerService('campaignService', campaignServiceInstance);
+
+module.exports = campaignServiceInstance;

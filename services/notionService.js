@@ -56,7 +56,7 @@ class NotionService {
           },
         },
       });
-
+  
       if (response.results.length === 0) {
         throw new Error(`No se encontró ningún equipo con el slug: ${slug}`);
       }
@@ -70,10 +70,15 @@ class NotionService {
       // Obtenemos las propiedades formateadas
       const teamData = this.formatTeams(response.results)[0];
       
-      // Retornamos un objeto que contiene tanto las propiedades como el contenido
+      // NUEVO: Obtener los pasajeros asociados a este equipo
+      const pasajerosService = require('./pasajerosService');
+      const teamMembers = await pasajerosService.getPasajerosByEquipo(teamData.id);
+      
+      // Retornamos un objeto que contiene tanto las propiedades como el contenido y miembros
       return {
         ...teamData,
-        pageContent: pageContent
+        pageContent: pageContent,
+        teamMembers: teamMembers  // Agregamos los miembros del equipo a la respuesta
       };
     } catch (error) {
       console.error(`Error al obtener equipo con slug ${slug}:`, error);
