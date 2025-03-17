@@ -428,92 +428,98 @@ async enrichCampaignsWithStatus(campaigns) {
 
   async createCampaign(campaignData) {
     try {
-        const { 
-            name, 
-            slug, 
-            accommodationType, 
-            totalCapacity,     
-            category, 
-            bathrooms,
-            priceNight,  // 🔹 Asegurar que se recibe PriceNight
-            amenities, 
-            direction, 
-            linkMaps, 
-            banner
-        } = campaignData;
-
-        // Validar campos requeridos
-        if (!name || !slug) {
-            throw new Error('El nombre de la cabaña y el slug son obligatorios');
+      const { 
+        name, 
+        slug, 
+        accommodationType, 
+        totalCapacity,     
+        category, 
+        bathrooms,
+        priceNight,
+        amenities, 
+        direction, 
+        linkMaps, 
+        banner,
+        wifi,
+        kitchen,
+        // Add any other properties you need to handle
+      } = campaignData;
+  
+      // Validar campos requeridos
+      if (!name || !slug) {
+        throw new Error('El nombre de la cabaña y el slug son obligatorios');
+      }
+  
+      // Verificar si el slug ya existe
+      const existingCampaign = await this.checkSlugExists(slug);
+      if (existingCampaign) {
+        throw new Error(`Ya existe un alojamiento con el slug: ${slug}`);
+      }
+  
+      // Preparar las propiedades para la creación
+      const properties = {
+        'Name': { 
+          title: [{ text: { content: name } }]
+        },
+        'slug': { 
+          rich_text: [{ text: { content: slug } }]
+        },
+        'AccommodationType': { 
+          select: { name: accommodationType || 'Cabaña' }
+        },
+        'TotalCapacity': { 
+          number: totalCapacity || 0
+        },
+        'Category': { 
+          select: { name: category || '' }
+        },
+        'direction': { 
+          rich_text: [{ text: { content: direction || '' } }]
+        },
+        'linkMaps': { 
+          url: linkMaps || ''
+        },
+        'banner': { 
+          url: banner || ''
         }
-
-        // Verificar si el slug ya existe
-        const existingCampaign = await this.checkSlugExists(slug);
-        if (existingCampaign) {
-            throw new Error(`Ya existe un alojamiento con el slug: ${slug}`);
-        }
-
-        // Preparar las propiedades para la creación
-        const properties = {
-            'Name': { 
-                title: [{ text: { content: name } }]
-            },
-            'slug': { 
-                rich_text: [{ text: { content: slug } }]
-            },
-            'AccommodationType': { 
-                select: { name: accommodationType }
-            },
-            'TotalCapacity': { 
-                number: totalCapacity 
-            },
-            'Category': { 
-                select: { name: category }
-            },
-            'direction': { 
-                rich_text: [{ text: { content: direction } }]
-            },
-            'linkMaps': { 
-                url: linkMaps 
-            },
-            'banner': { 
-                url: banner 
-            }
-        };
-
-        // 🔹 Corregir bathrooms si existe
-        if (bathrooms !== undefined) {
-            properties['bathrooms'] = { number: bathrooms };
-        }
-
-        // 🔹 Incluir PriceNight si está en el request
-        if (priceNight !== undefined) {
-            properties['PriceNight'] = { number: priceNight };
-        }
-
-        // 🔹 Agregar amenities correctamente
-        if (amenities) {
-            if (amenities.gym !== undefined) properties['gym'] = { checkbox: amenities.gym };
-            if (amenities.skiroom !== undefined) properties['skiroom'] = { checkbox: amenities.skiroom };
-            if (amenities.food !== undefined) properties['food'] = { checkbox: amenities.food };
-        }
-
-        // Crear la página en Notion con reintentos
-        const createInNotion = withRetry(async () => {
-            return await notion.pages.create({
-                parent: { database_id: campaignsDatabaseId },
-                properties
-            });
+      };
+  
+      // Añadir campos numéricos si existen
+      if (bathrooms !== undefined) {
+        properties['bathrooms'] = { number: bathrooms };
+      }
+  
+      if (priceNight !== undefined) {
+        properties['PriceNight'] = { number: priceNight };
+      }
+  
+      // Añadir amenities
+      if (amenities) {
+        if (amenities.gym !== undefined) properties['gym'] = { checkbox: amenities.gym };
+        if (amenities.skiroom !== undefined) properties['skiroom'] = { checkbox: amenities.skiroom };
+        if (amenities.food !== undefined) properties['food'] = { checkbox: amenities.food };
+      }
+  
+      // Añadir otros checkboxes
+      if (wifi !== undefined) properties['Wifi'] = { checkbox: wifi };
+      if (kitchen !== undefined) properties['Kitchen'] = { checkbox: kitchen };
+  
+      // Crear la página en Notion con reintentos
+      const createInNotion = withRetry(async () => {
+        return await notion.pages.create({
+          parent: { database_id: campaignsDatabaseId },
+          properties
         });
-
-        const response = await createInNotion();
-        return this.formatCampaign(response);
-
+      });
+  
+      const response = await createInNotion();
+      return this.formatCampaign(response);
+  
     } catch (error) {
-        console.error('Error al crear alojamiento en Notion:', error);
-        throw new Error(`Error al crear alojamiento: ${error.message}`);
+      console.error('Error al crear alojamiento en Notion:', error);
+      throw new Error(`Error al crear alojamiento: ${error.message}`);
     }
-}
+  }
 
 
 async checkSlugExists(slug) {
@@ -974,9 +980,7 @@ formatCampaigns(pages) {
       id: page.id,
       name: properties.Name?.title?.map(title => title.plain_text).join('') || '',
       slug: properties.slug?.rich_text?.map(text => text.plain_text).join('') || '',
-      // Usar accommodationType en lugar de Category
       accommodationType: properties.AccommodationType?.select?.name || 'Cabaña',
-      // Usar totalCapacity en lugar de NrBeds
       totalCapacity: properties.TotalCapacity?.number || 0,
       bathrooms: properties.bathrooms?.number || 0,
       pricePerNight: properties.PriceNight?.number || 0,
@@ -987,6 +991,9 @@ formatCampaigns(pages) {
       gym: properties.gym?.checkbox || false,
       skiroom: properties.skiroom?.checkbox || false,
       food: properties.food?.checkbox || false,
+      category: properties.Category?.select?.name || '',
+      availableBeds: properties.availableBeds?.number || 0,
+      reservationStatus: properties.reservationStatus?.select?.name || 'Disponible',
       admin: properties.Admin?.people?.map(person => ({
         id: person.id,
         name: person.name,
