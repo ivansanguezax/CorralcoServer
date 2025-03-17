@@ -281,47 +281,54 @@ class ReservationService {
     }
   }
   
-  async getTeamReservations(teamId) {
-    try {
-      const horarios = await horariosService.getHorariosByEquipo(teamId);
-      
-      // Formatear la respuesta
-      const reservations = [];
-      
-      for (const horario of horarios) {
-        try {
-          const cabin = await campaignService.getCampaignById(horario.cabana);
-          
-          const currentDate = new Date().toISOString().split('T')[0];
-          let status = 'Finalizada';
-          
-          if (horario.checkInDate <= currentDate && horario.checkOutDate >= currentDate) {
-            status = 'Activa';
-          } else if (horario.checkInDate > currentDate) {
-            status = 'Reservada';
-          }
-          
-          reservations.push({
-            id: horario.id,
-            cabinId: horario.cabana,
-            cabinName: cabin.name,
-            teamId: horario.equipo,
-            checkInDate: horario.checkInDate,
-            checkOutDate: horario.checkOutDate,
-            precioTotal: horario.precioTotal,
-            status
-          });
-        } catch (error) {
-          console.error(`Error al procesar horario ${horario.id}:`, error);
+// En reservationService.js, modifica el método getTeamReservations:
+
+async getTeamReservations(teamId) {
+  try {
+    // Usar serviceResolver para obtener horariosService para evitar dependencia circular
+    const horariosService = require('./serviceResolver').getService('horariosService');
+    
+    const horarios = await horariosService.getHorariosByEquipo(teamId);
+    
+    // Formatear la respuesta
+    const reservations = [];
+    
+    for (const horario of horarios) {
+      try {
+        // También usar serviceResolver para campaignService
+        const campaignService = require('./serviceResolver').getService('campaignService');
+        const cabin = await campaignService.getCampaignById(horario.cabana);
+        
+        const currentDate = new Date().toISOString().split('T')[0];
+        let status = 'Finalizada';
+        
+        if (horario.checkInDate <= currentDate && horario.checkOutDate >= currentDate) {
+          status = 'Activa';
+        } else if (horario.checkInDate > currentDate) {
+          status = 'Reservada';
         }
+        
+        reservations.push({
+          id: horario.id,
+          cabinId: horario.cabana,
+          cabinName: cabin.name,
+          teamId: horario.equipo,
+          checkInDate: horario.checkInDate,
+          checkOutDate: horario.checkOutDate,
+          precioTotal: horario.precioTotal,
+          status
+        });
+      } catch (error) {
+        console.error(`Error al procesar horario ${horario.id}:`, error);
       }
-      
-      return reservations;
-    } catch (error) {
-      console.error(`Error al obtener reservas para el equipo ${teamId}:`, error);
-      throw error;
     }
+    
+    return reservations;
+  } catch (error) {
+    console.error(`Error al obtener reservas para el equipo ${teamId}:`, error);
+    throw error;
   }
+}
 }
 
 module.exports = new ReservationService();
