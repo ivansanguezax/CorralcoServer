@@ -1,6 +1,7 @@
 const notionService = require('./notionService');
 const campaignService = require('./campaignService');
-const horariosService = require('./horariosService');
+const horariosService = require('./serviceResolver').getService('horariosService');
+
 
 class ReservationService {
   async createReservation(teamId, cabinId, checkInDate, checkOutDate, precioTotal, numBeds = 1) {

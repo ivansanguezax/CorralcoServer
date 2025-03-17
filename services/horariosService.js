@@ -582,20 +582,23 @@ async checkHostalAvailability(
   async confirmHorario(horarioId) {
     try {
       const horario = await this.getHorarioById(horarioId);
-
+  
       if (!horario) {
         throw new Error("No se encontró la reserva");
       }
-
+  
       if (horario.estado === "Confirmada") {
         return horario; // Ya está confirmada
       }
-
+  
       // Verificar que sigue siendo posible confirmar esta reserva
       if (horario.cabana) {
+        // Usar el serviceResolver para obtener campaignService
+        const campaignService = require('./serviceResolver').getService('campaignService');
+        
         const campaign = await campaignService.getCampaignById(horario.cabana);
         const isHostal = campaign.accommodationType === "Hostal";
-
+  
         if (isHostal) {
           // Para hostales, verificar que aún hay camas disponibles suficientes
           // Obtener todas las reservas confirmadas que se solapan con el periodo solicitado
@@ -670,18 +673,18 @@ async checkHostalAvailability(
               ],
             },
           });
-
+  
           // Calcular camas ocupadas excluyendo la reserva actual
           let occupiedBeds = 0;
           const conflictingReservations = this.formatHorarios(response.results);
-
+  
           for (const reservation of conflictingReservations) {
             // Excluir la reserva actual del cálculo
             if (reservation.id !== horarioId) {
               occupiedBeds += reservation.numBeds || 1;
             }
           }
-
+  
           // Verificar si hay suficientes camas disponibles
           const availableBeds = campaign.totalCapacity - occupiedBeds;
           if (availableBeds < (horario.numBeds || 1)) {
@@ -696,13 +699,13 @@ async checkHostalAvailability(
             horario.checkInDate,
             horario.checkOutDate
           );
-
+  
           // Filtrar para excluir la reserva actual
           const conflictsExcludingCurrent =
             availability.conflictingReservations.filter(
               (res) => res.id !== horarioId
             );
-
+  
           if (conflictsExcludingCurrent.length > 0) {
             throw new Error(
               "La cabaña ya no está disponible para las fechas seleccionadas"
@@ -710,7 +713,7 @@ async checkHostalAvailability(
           }
         }
       }
-
+  
       // Actualizar el estado a Confirmada
       const response = await notion.pages.update({
         page_id: horarioId,
@@ -722,14 +725,16 @@ async checkHostalAvailability(
           },
         },
       });
-
+  
       const updatedHorario = this.formatHorario(response);
-
+  
       // Invalidar caché
       if (horario.cabana) {
+        // Usar serviceResolver para obtener campaignService
+        const campaignService = require('./serviceResolver').getService('campaignService');
         await campaignService.invalidateCache(horario.cabana);
       }
-
+  
       return updatedHorario;
     } catch (error) {
       console.error(`Error al confirmar horario ${horarioId}:`, error);
