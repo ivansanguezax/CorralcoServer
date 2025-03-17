@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const reservationService = require('../services/reservationServices');
+const reservationService = require('../services/reservationService');
 const campaignService = require('../services/campaignService');
 
 // Obtener todas las reservas (activas y futuras)

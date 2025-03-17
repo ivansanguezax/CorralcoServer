@@ -124,11 +124,8 @@ class HorariosService {
 
       return horarios;
     } catch (error) {
-      console.error(
-        `Error al obtener horarios para el equipo ${equipoId}:`,
-        error
-      );
-      throw new Error("Error al consultar horarios para este equipo");
+      console.error(`Error al obtener horarios para el equipo ${equipoId}:`, error);
+      throw new Error("Error al consultar horarios para este equipo"); // Este es el mensaje de error que estás viendo
     }
   }
 
