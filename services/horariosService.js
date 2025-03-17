@@ -75,7 +75,7 @@ class HorariosService {
       if (cachedHorarios) {
         return cachedHorarios;
       }
-
+  
       // Función para consultar a Notion con reintentos manualmente
       const fetchFromNotion = async () => {
         // Implementación manual de reintentos
@@ -85,7 +85,7 @@ class HorariosService {
             return await notion.databases.query({
               database_id: this.databaseId,
               filter: {
-                property: "Equipo",
+                property: "ReservadoPor",
                 relation: {
                   contains: equipoId,
                 },
@@ -115,17 +115,17 @@ class HorariosService {
         }
         throw lastError;
       };
-
+  
       const response = await fetchFromNotion();
       const horarios = this.formatHorarios(response.results);
-
+  
       // Guardar en caché por 5 minutos
       await cacheService.set(cacheKey, horarios, 300);
-
+  
       return horarios;
     } catch (error) {
       console.error(`Error al obtener horarios para el equipo ${equipoId}:`, error);
-      throw new Error("Error al consultar horarios para este equipo"); // Este es el mensaje de error que estás viendo
+      throw new Error("Error al consultar horarios para este equipo");
     }
   }
 
@@ -1006,6 +1006,7 @@ async checkHostalAvailability(
       }
   
       let equipo = null;
+      // Intentar obtener el equipo de cualquiera de las dos propiedades posibles
       if (
         properties["ReservadoPor"]?.relation &&
         properties["ReservadoPor"].relation.length > 0
