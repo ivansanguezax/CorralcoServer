@@ -310,12 +310,7 @@ async enrichCampaignsWithStatus(campaigns) {
   
       // Ejecutar la consulta a través de la cola
       const queryNotionWithQueue = async () => {
-        // Función de reintento
-        const retry = async (fn, maxRetries = 5) => {
-          // ... [existing retry code]
-        };
-  
-        // Ejecutar consulta a Notion con reintentos
+        // Usar la función retry global en lugar de redefinirla localmente
         const response = await retry(async () => {
           return await notion.databases.query({
             database_id: campaignsDatabaseId,
@@ -328,15 +323,25 @@ async enrichCampaignsWithStatus(campaigns) {
           });
         });
         
+        if (!response) {
+          throw new Error(`Error al consultar la base de datos para el slug ${slug}`);
+        }
+        
         if (response.results.length === 0) {
           throw new Error(`No se encontró el alojamiento con el slug ${slug}`);
         }
-  
+        
         return response;
       };
   
       // Usar la cola para la consulta principal
       const response = await notionQueue.enqueue(queryNotionWithQueue);
+      
+      // Verificación de seguridad para la respuesta
+      if (!response || !response.results || response.results.length === 0) {
+        throw new Error(`No se encontró el alojamiento con el slug ${slug}`);
+      }
+      
       const pageData = this.formatCampaign(response.results[0]);
   
       // Determinar el estado actual del alojamiento (usar cola)
@@ -357,18 +362,35 @@ async enrichCampaignsWithStatus(campaigns) {
         this.getPageContent(pageData.id)
       );
   
-      // FIX: Obtener las reservas (resolver el servicio correctamente)
+      // Obtener las reservas usando el servicio resuelto correctamente
       const horariosServiceInstance = require('./serviceResolver').getService('horariosService');
       
       // Verificar que el servicio esté disponible
       if (!horariosServiceInstance) {
-        throw new Error('Servicio de horarios no disponible');
+        console.warn('Servicio de horarios no disponible, se continuará sin reservas');
+        // En lugar de lanzar un error, continuar sin las reservas
+        const result = {
+          ...pageData,
+          content: pageContent,
+          reservations: [] // Proporcionar un array vacío por defecto
+        };
+        
+        // Guardar en caché por un tiempo mayor (30 minutos)
+        await cacheService.set(cacheKey, result, 1800);
+        
+        return result;
       }
       
-      // Usar el servicio resuelto para obtener los horarios
-      const reservations = await notionQueue.enqueue(() =>
-        horariosServiceInstance.getHorariosByCabana(pageData.id)
-      );
+      // Intentar obtener reservas, pero manejar posibles errores
+      let reservations = [];
+      try {
+        reservations = await notionQueue.enqueue(() =>
+          horariosServiceInstance.getHorariosByCabana(pageData.id)
+        );
+      } catch (reservationError) {
+        console.error(`Error al obtener reservas para ${pageData.id}:`, reservationError);
+        // Continuar sin las reservas en caso de error
+      }
   
       // Agregar el contenido y las reservas a los datos de la página
       const result = {
