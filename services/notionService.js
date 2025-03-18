@@ -92,6 +92,11 @@ class NotionService {
  * @param {Object} teamData - Datos del equipo a crear
  * @returns {Object} El equipo creado y formateado
  */
+/**
+ * Crea un nuevo equipo en la base de datos de Notion
+ * @param {Object} teamData - Datos del equipo a crear
+ * @returns {Object} El equipo creado y formateado
+ */
 async createTeam(teamData) {
   try {
     const { 
@@ -117,6 +122,9 @@ async createTeam(teamData) {
       throw new Error(`Ya existe un equipo con el slug: ${slug}`);
     }
     
+    // Crear la URL web del equipo basada en el slug
+    const linkWeb = `https://corralco.vercel.app/team/${slug}/join`;
+    
     // Preparar las propiedades para la creación
     const properties = {
       'TeamName': {
@@ -136,6 +144,9 @@ async createTeam(teamData) {
             }
           }
         ]
+      },
+      'LinkWeb': {
+        url: linkWeb
       }
     };
     
