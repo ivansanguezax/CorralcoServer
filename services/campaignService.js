@@ -301,12 +301,7 @@ async enrichCampaignsWithStatus(campaigns) {
 
   async getCampaignBySlug(slug) {
     try {
-      // Intentar obtener desde caché
-      const cacheKey = `campaign:slug:${slug}`;
-      const cachedCampaign = await cacheService.get(cacheKey);
-      if (cachedCampaign) {
-        return cachedCampaign;
-      }
+
   
       // Ejecutar la consulta a través de la cola
       const queryNotionWithQueue = async () => {
