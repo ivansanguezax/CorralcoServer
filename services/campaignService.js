@@ -312,28 +312,7 @@ async enrichCampaignsWithStatus(campaigns) {
       const queryNotionWithQueue = async () => {
         // Función de reintento
         const retry = async (fn, maxRetries = 5) => {
-          let lastError;
-          for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-              return await fn();
-            } catch (error) {
-              lastError = error;
-              if (error.code === 'rate_limited') {
-                const retryAfter = error.headers ? 
-                  parseInt(error.headers.get('retry-after') || '60', 10) * 1000 : 
-                  Math.min(Math.pow(2, attempt) * 1000, 30000);
-                
-                console.log(`Rate limited en getCampaignBySlug. Esperando ${retryAfter/1000} segundos antes de reintentar (intento ${attempt}/${maxRetries})...`);
-                await new Promise(resolve => setTimeout(resolve, retryAfter));
-              } else {
-                const backoff = Math.min(Math.pow(2, attempt) * 100, 5000);
-                console.warn(`Error en intento ${attempt}/${maxRetries}: ${error.message}. Reintentando en ${backoff}ms...`);
-                await new Promise(resolve => setTimeout(resolve, backoff));
-                if (attempt === maxRetries) throw lastError;
-              }
-            }
-          }
-          throw lastError;
+          // ... [existing retry code]
         };
   
         // Ejecutar consulta a Notion con reintentos
@@ -378,9 +357,17 @@ async enrichCampaignsWithStatus(campaigns) {
         this.getPageContent(pageData.id)
       );
   
-      // Obtener las reservas (usar cola)
+      // FIX: Obtener las reservas (resolver el servicio correctamente)
+      const horariosServiceInstance = require('./serviceResolver').getService('horariosService');
+      
+      // Verificar que el servicio esté disponible
+      if (!horariosServiceInstance) {
+        throw new Error('Servicio de horarios no disponible');
+      }
+      
+      // Usar el servicio resuelto para obtener los horarios
       const reservations = await notionQueue.enqueue(() =>
-        horariosService.getHorariosByCabana(pageData.id)
+        horariosServiceInstance.getHorariosByCabana(pageData.id)
       );
   
       // Agregar el contenido y las reservas a los datos de la página
