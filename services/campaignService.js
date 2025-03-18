@@ -301,8 +301,15 @@ async enrichCampaignsWithStatus(campaigns) {
 
   async getCampaignBySlug(slug) {
     try {
-
-  
+      // Define the cache key - this was missing in your original code
+      const cacheKey = `campaign:slug:${slug}`;
+      
+      // Try to get from cache first
+      const cachedCampaign = await cacheService.get(cacheKey);
+      if (cachedCampaign) {
+        return cachedCampaign;
+      }
+    
       // Ejecutar la consulta a través de la cola
       const queryNotionWithQueue = async () => {
         // Usar la función retry global en lugar de redefinirla localmente
@@ -328,7 +335,7 @@ async enrichCampaignsWithStatus(campaigns) {
         
         return response;
       };
-  
+    
       // Usar la cola para la consulta principal
       const response = await notionQueue.enqueue(queryNotionWithQueue);
       
@@ -338,12 +345,12 @@ async enrichCampaignsWithStatus(campaigns) {
       }
       
       const pageData = this.formatCampaign(response.results[0]);
-  
+    
       // Determinar el estado actual del alojamiento (usar cola)
       pageData.reservationStatus = await notionQueue.enqueue(() => 
         this.determineReservationStatus(pageData.id)
       );
-  
+    
       // Calcular camas disponibles para hostales (usar cola)
       if (pageData.accommodationType === "Hostal") {
         pageData.availableBeds = await notionQueue.enqueue(() => 
@@ -351,12 +358,12 @@ async enrichCampaignsWithStatus(campaigns) {
         );
         pageData.occupiedBeds = pageData.totalCapacity - pageData.availableBeds;
       }
-  
+    
       // Obtener el contenido de la página (usar cola)
       const pageContent = await notionQueue.enqueue(() => 
         this.getPageContent(pageData.id)
       );
-  
+    
       // Obtener las reservas usando el servicio resuelto correctamente
       const horariosServiceInstance = require('./serviceResolver').getService('horariosService');
       
@@ -386,17 +393,17 @@ async enrichCampaignsWithStatus(campaigns) {
         console.error(`Error al obtener reservas para ${pageData.id}:`, reservationError);
         // Continuar sin las reservas en caso de error
       }
-  
+    
       // Agregar el contenido y las reservas a los datos de la página
       const result = {
         ...pageData,
         content: pageContent,
         reservations,
       };
-  
+    
       // Guardar en caché por un tiempo mayor (30 minutos)
       await cacheService.set(cacheKey, result, 1800);
-  
+    
       return result;
     } catch (error) {
       console.error(`Error al obtener el alojamiento con slug ${slug}:`, error);
