@@ -53,66 +53,40 @@ const withRetry = (fn) => (...args) => retry(() => fn(...args));
 
 class campaignService {
 
-  async getAllCampaigns() {
-    try {
-      // Intentar obtener desde caché
-      const cachedCampaigns = await cacheService.get(CACHE_KEYS.ALL_CAMPAIGNS);
-      if (cachedCampaigns) {
-        return cachedCampaigns;
-      }
-
-      // Función para consultar a Notion con reintentos
-      const fetchFromNotion = withRetry(async () => {
-        const response = await notion.databases.query({
-          database_id: campaignsDatabaseId,
-          sorts: [
-            {
-              property: "Name",
-              direction: "ascending",
-            },
-          ],
-        });
-        return response;
+async getAllCampaigns() {
+  try {
+    // Función para consultar a Notion con reintentos
+    const fetchFromNotion = withRetry(async () => {
+      const response = await notion.databases.query({
+        database_id: campaignsDatabaseId,
+        sorts: [
+          {
+            property: "Name",
+            direction: "ascending",
+          },
+        ],
       });
+      return response;
+    });
 
-      const response = await fetchFromNotion();
-      const campaigns = this.formatCampaigns(response.results);
+    const response = await fetchFromNotion();
+    const campaigns = this.formatCampaigns(response.results);
 
-      // Procesar y enriquecer los datos
-      await this.enrichCampaignsWithStatus(campaigns);
+    // Procesar y enriquecer los datos
+    await this.enrichCampaignsWithStatus(campaigns);
 
-      // Guardar en caché
-      await cacheService.set(
-        CACHE_KEYS.ALL_CAMPAIGNS,
-        campaigns,
-        CACHE_TTL.DEFAULT
-      );
+    // También guardar listas filtradas sin caché para mantener consistencia
+    const cabañas = campaigns.filter((c) => c.accommodationType === "Cabaña");
+    const hostales = campaigns.filter((c) => c.accommodationType === "Hostal");
 
-      // También guardar listas filtradas
-      const cabañas = campaigns.filter((c) => c.accommodationType === "Cabaña");
-      const hostales = campaigns.filter(
-        (c) => c.accommodationType === "Hostal"
-      );
-
-      await cacheService.set(
-        CACHE_KEYS.CABINS_ONLY,
-        cabañas,
-        CACHE_TTL.DEFAULT
-      );
-      await cacheService.set(
-        CACHE_KEYS.HOSTELS_ONLY,
-        hostales,
-        CACHE_TTL.DEFAULT
-      );
-
-      return campaigns;
-    } catch (error) {
-      console.error("Error al obtener los alojamientos:", error);
-      throw new Error(
-        "Error al obtener los alojamientos desde Notion: " + error.message
-      );
-    }
+    return campaigns;
+  } catch (error) {
+    console.error("Error al obtener los alojamientos:", error);
+    throw new Error(
+      "Error al obtener los alojamientos desde Notion: " + error.message
+    );
   }
+}
 
   async getCabinsByType(type) {
     try {
@@ -426,6 +400,80 @@ async enrichCampaignsWithStatus(campaigns) {
     }
   }
 
+  async updateCampaignImages(campaignId, imagesData) {
+    try {
+      // Resolver el servicio de Cloudinary
+      const cloudinaryService = serviceResolver.resolve('cloudinaryService');
+      
+      if (!cloudinaryService) {
+        throw new Error('Servicio de Cloudinary no disponible');
+      }
+      
+      const properties = {};
+      
+      // Procesar banner si está presente
+      if (imagesData.banner) {
+        const bannerResult = await cloudinaryService.uploadImage(
+          imagesData.banner.base64, 
+          `${campaignId}_banner`, 
+          'accommodation/banners'
+        );
+        
+        properties.banner = {
+          url: bannerResult.url
+        };
+      }
+      
+      // Procesar imágenes de portada si están presentes
+      if (imagesData.coverImages && imagesData.coverImages.length > 0) {
+        const coverImagesUploaded = await cloudinaryService.uploadMultipleImages(
+          imagesData.coverImages.map((img, index) => ({
+            base64: img.base64,
+            name: `${campaignId}_cover_${index + 1}`
+          })),
+          'accommodation/covers'
+        );
+        
+        // Asignar URLs a las propiedades correspondientes
+        if (coverImagesUploaded.length > 0) {
+          properties.ImageCover1 = { url: coverImagesUploaded[0].url };
+        }
+        
+        if (coverImagesUploaded.length > 1) {
+          properties.ImageCover2 = { url: coverImagesUploaded[1].url };
+        }
+        
+        if (coverImagesUploaded.length > 2) {
+          properties.ImageCover3 = { url: coverImagesUploaded[2].url };
+        }
+      }
+      
+      // Si no hay propiedades para actualizar, salir temprano
+      if (Object.keys(properties).length === 0) {
+        throw new Error('No se proporcionaron imágenes para actualizar');
+      }
+      
+      // Actualizar página en Notion con reintentos
+      const updateInNotion = withRetry(async () => {
+        return await notion.pages.update({
+          page_id: campaignId,
+          properties,
+        });
+      });
+      
+      const response = await updateInNotion();
+      
+      // Invalidar caché para este alojamiento
+      await this.invalidateCache(campaignId);
+      
+      return this.formatCampaign(response);
+    } catch (error) {
+      console.error(`Error al actualizar imágenes para campaña ${campaignId}:`, error);
+      throw new Error(`Error al actualizar imágenes: ${error.message}`);
+    }
+  }
+  
+  // También modificar createCampaign para manejar imágenes base64
   async createCampaign(campaignData) {
     try {
       const { 
@@ -440,6 +488,8 @@ async enrichCampaignsWithStatus(campaigns) {
         direction, 
         linkMaps, 
         banner,
+        bannerBase64,
+        coverImagesBase64,
         wifi,
         kitchen,
         // Add any other properties you need to handle
@@ -478,11 +528,13 @@ async enrichCampaignsWithStatus(campaigns) {
         },
         'linkMaps': { 
           url: linkMaps || ''
-        },
-        'banner': { 
-          url: banner || ''
         }
       };
+  
+      // Si se proporciona una URL de banner directamente, usarla
+      if (banner) {
+        properties['banner'] = { url: banner };
+      }
   
       // Añadir campos numéricos si existen
       if (bathrooms !== undefined) {
@@ -513,8 +565,31 @@ async enrichCampaignsWithStatus(campaigns) {
       });
   
       const response = await createInNotion();
-      return this.formatCampaign(response);
+      const newCampaign = this.formatCampaign(response);
+      
+      // Si hay imágenes base64, subirlas después de crear la campaña
+      if (bannerBase64 || (coverImagesBase64 && coverImagesBase64.length > 0)) {
+        const imageData = {};
+        
+        if (bannerBase64) {
+          imageData.banner = { base64: bannerBase64 };
+        }
+        
+        if (coverImagesBase64 && coverImagesBase64.length > 0) {
+          imageData.coverImages = coverImagesBase64.map((base64, index) => ({
+            base64,
+            name: `${slug}_cover_${index + 1}`
+          }));
+        }
+        
+        // Actualizar la campaña con las imágenes
+        await this.updateCampaignImages(newCampaign.id, imageData);
+        
+        // Obtener la versión actualizada
+        return await this.getCampaignById(newCampaign.id);
+      }
   
+      return newCampaign;
     } catch (error) {
       console.error('Error al crear alojamiento en Notion:', error);
       throw new Error(`Error al crear alojamiento: ${error.message}`);
